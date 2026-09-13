@@ -16,9 +16,21 @@ an LWW-Element-Set CRDT (Lamport timestamps + tombstones).
 
 ```sh
 cargo test --workspace          # run all tests
-cargo run -p weavedraw-server   # start the server (step 3)
+cargo run -p weavedraw-server   # start the server on ws://127.0.0.1:8080/ws
 cargo run -p weavedraw          # start a client   (step 4)
 ```
+
+### Server configuration
+
+| Variable              | Default          | Meaning                                  |
+|-----------------------|------------------|------------------------------------------|
+| `WEAVEDRAW_ADDR`      | `127.0.0.1:8080` | Listen address                           |
+| `WEAVEDRAW_DATA_DIR`  | `./data`         | Room snapshots (`<room>.bincode`)        |
+| `WEAVEDRAW_MAX_PEERS` | `64`             | Connections per room before `RoomFull`   |
+| `WEAVEDRAW_FLUSH_SECS`| `2`              | Interval for writing dirty rooms to disk |
+| `RUST_LOG`            | `info,server=debug` | `tracing` filter                      |
+
+HTTP routes: `GET /ws` (WebSocket upgrade), `GET /rooms` (JSON), `GET /health`.
 
 Enable `--features json-wire` on **both** binaries to switch the wire format
 from bincode to JSON for debugging with `websocat`.
@@ -27,5 +39,5 @@ from bincode to JSON for debugging with `websocat`.
 
 - [x] Step 1 — workspace & dependencies
 - [x] Step 2 — shared types, CRDT, protocol, codec
-- [ ] Step 3 — server
+- [x] Step 3 — server (rooms, broadcast, persistence, graceful shutdown)
 - [ ] Step 4 — client

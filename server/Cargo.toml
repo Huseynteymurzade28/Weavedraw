@@ -5,6 +5,10 @@ edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 
+[lib]
+name = "server"
+path = "src/lib.rs"
+
 [[bin]]
 name = "weavedraw-server"
 path = "src/main.rs"
@@ -18,7 +22,13 @@ common.workspace = true
 tokio.workspace = true
 axum.workspace = true
 futures-util.workspace = true
+serde.workspace = true
+serde_json.workspace = true
 uuid.workspace = true
 anyhow.workspace = true
+thiserror.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
+
+[dev-dependencies]
+tokio-tungstenite.workspace = true
