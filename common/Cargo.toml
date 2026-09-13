@@ -1,0 +1,22 @@
+[package]
+name = "weavedraw-common"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[lib]
+name = "common"
+path = "src/lib.rs"
+
+[features]
+default = []
+# Swap the wire format from bincode to pretty JSON. Both peers must agree.
+json-wire = []
+
+[dependencies]
+serde.workspace = true
+serde_json.workspace = true
+bincode.workspace = true
+uuid.workspace = true
+thiserror.workspace = true

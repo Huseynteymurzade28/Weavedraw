@@ -1,0 +1,46 @@
+[workspace]
+resolver = "3"
+members = ["common", "server", "client"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.85"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/huso/weavedraw"
+
+[workspace.dependencies]
+# Internal
+common = { path = "common", package = "weavedraw-common" }
+
+# Serialization
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+bincode = { version = "2", default-features = false, features = ["std", "serde"] }
+
+# Identity / errors / logging
+uuid = { version = "1", features = ["v4", "serde"] }
+thiserror = "2"
+anyhow = "1"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+# Server
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "net", "time", "fs", "signal"] }
+axum = { version = "0.8", features = ["ws"] }
+futures-util = { version = "0.3", default-features = false, features = ["sink", "std"] }
+
+# Client
+eframe = { version = "0.36", default-features = false, features = ["default_fonts", "glow", "wayland", "x11"] }
+egui = "0.36"
+tokio-tungstenite = "0.30"
+crossbeam-channel = "0.5"
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1
+
+# Keep the dev-profile client snappy: egui + glow are slow at opt-level 0.
+[profile.dev.package."*"]
+opt-level = 2
