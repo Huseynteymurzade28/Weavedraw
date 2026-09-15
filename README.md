@@ -10,14 +10,14 @@ an LWW-Element-Set CRDT (Lamport timestamps + tombstones).
 |----------|--------------------|----------------------------------------------------------------|
 | `common` | `weavedraw-common` | Domain types, CRDT (`StrokeSet`), wire protocol, bincode codec |
 | `server` | `weavedraw-server` | Room registry, WebSocket broadcast, snapshot persistence       |
-| `client` | `weavedraw`        | Hardware-accelerated canvas, floating toolbar, network loop    |
+| `client` | `weavedraw-client` | Hardware-accelerated canvas, floating toolbar, network loop    |
 
 ## Build & run
 
 ```sh
 cargo test --workspace          # run all tests
 cargo run -p weavedraw-server   # start the server on ws://127.0.0.1:8080/ws
-cargo run -p weavedraw -- ROOM  # start a client and join ROOM (default: lobby)
+cargo run -p weavedraw-client -- ROOM   # start a client and join ROOM (default: lobby)
 ```
 
 ### Server configuration
