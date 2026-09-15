@@ -5,7 +5,7 @@ use std::time::{Duration, Instant};
 
 use common::{
     ClientId, ClientMessage, CursorState, LamportClock, Rgba, ServerMessage, Stroke, StrokeDelta,
-    StrokeId, StrokeOp, StrokeSet,
+    StrokeId, StrokeOp, StrokeSet, geom,
 };
 use egui::{
     Align2, Area, Color32, CursorIcon, Frame, Id, Key, Modifiers, Order, PointerButton, Pos2, Rect,
@@ -14,6 +14,7 @@ use egui::{
 use tracing::{debug, warn};
 
 use crate::canvas::{self, Camera};
+use crate::gpu::StrokeRenderer;
 use crate::net::{NetConfig, NetEvent, NetHandle};
 
 /// Curated brush palette shown as swatches in the toolbar.
@@ -78,6 +79,41 @@ enum Connection {
     },
 }
 
+/// The replicated stroke set plus a counter that advances on every visible
+/// change, so renderers can tell at a glance whether anything moved.
+#[derive(Default)]
+struct Document {
+    set: StrokeSet,
+    generation: u64,
+}
+
+impl Document {
+    fn apply(&mut self, op: StrokeOp) -> bool {
+        let changed = self.set.apply(op);
+        self.generation += u64::from(changed);
+        changed
+    }
+
+    fn apply_all(&mut self, ops: impl IntoIterator<Item = StrokeOp>) -> usize {
+        let changed = self.set.apply_all(ops);
+        self.generation += changed as u64;
+        changed
+    }
+
+    fn merge(&mut self, other: StrokeSet) -> usize {
+        let changed = self.set.merge(other);
+        self.generation += changed as u64;
+        changed
+    }
+}
+
+impl std::ops::Deref for Document {
+    type Target = StrokeSet;
+    fn deref(&self) -> &StrokeSet {
+        &self.set
+    }
+}
+
 /// A stroke being drawn locally: the payload plus how much of it has already
 /// been streamed to peers as `StrokeDelta`s.
 struct Drawing {
@@ -89,6 +125,8 @@ const MAX_HISTORY: usize = 200;
 const CURSOR_SEND_INTERVAL: Duration = Duration::from_millis(33);
 /// Minimum pointer travel (screen px) before a new point is recorded.
 const MIN_SEGMENT_PX: f32 = 1.5;
+/// RDP tolerance (screen px at drawing zoom) applied when a stroke is committed.
+const SIMPLIFY_PX: f32 = 0.4;
 
 pub struct WeavedrawApp {
     // Identity & document
@@ -96,7 +134,7 @@ pub struct WeavedrawApp {
     name: String,
     presence: Rgba,
     room: String,
-    doc: StrokeSet,
+    doc: Document,
     clock: LamportClock,
 
     // Editing
@@ -113,6 +151,11 @@ pub struct WeavedrawApp {
     // View
     camera: Camera,
     space_held: bool,
+    /// GPU-resident committed strokes; `None` falls back to painting
+    /// through egui every frame (e.g. when eframe runs without OpenGL).
+    renderer: Option<StrokeRenderer>,
+    /// Last frame's CPU time as reported by eframe (for the status bar).
+    frame_cpu: Option<Duration>,
 
     // Presence
     peers: HashMap<ClientId, CursorState>,
@@ -131,12 +174,23 @@ impl WeavedrawApp {
     pub fn new(cc: &eframe::CreationContext<'_>, config: NetConfig) -> Self {
         cc.egui_ctx.set_theme(egui::Theme::Dark);
         let net = crate::net::spawn(config.clone(), cc.egui_ctx.clone());
+        let renderer = match cc.gl.clone().map(StrokeRenderer::new) {
+            Some(Ok(r)) => Some(r),
+            Some(Err(e)) => {
+                warn!("GPU stroke renderer unavailable, using CPU path: {e}");
+                None
+            }
+            None => {
+                warn!("no OpenGL context, using CPU path");
+                None
+            }
+        };
         Self {
             me: config.client_id,
             name: config.name,
             presence: config.color,
             room: config.room,
-            doc: StrokeSet::new(),
+            doc: Document::default(),
             clock: LamportClock::new(config.client_id),
             tool: Tool::Pen,
             brush_color: PALETTE[6],
@@ -147,6 +201,8 @@ impl WeavedrawApp {
             erasing: None,
             camera: Camera::default(),
             space_held: false,
+            renderer,
+            frame_cpu: None,
             peers: HashMap::new(),
             previews: HashMap::new(),
             last_cursor: None,
@@ -454,8 +510,11 @@ impl WeavedrawApp {
         }
 
         if response.drag_stopped_by(PointerButton::Primary)
-            && let Some(d) = self.drawing.take()
+            && let Some(mut d) = self.drawing.take()
         {
+            // Shed redundant samples before the stroke is replicated; the
+            // tolerance is a fraction of a pixel at the zoom it was drawn at.
+            d.stroke.points = geom::simplify(&d.stroke.points, SIMPLIFY_PX / self.camera.zoom);
             let ts = self.clock.tick();
             self.commit(
                 vec![StrokeOp::Add {
@@ -547,7 +606,13 @@ impl WeavedrawApp {
 
     // ---- painting ---------------------------------------------------------
 
-    fn paint_canvas(&self, ui: &Ui, painter: &egui::Painter, rect: Rect, pointer: Option<Pos2>) {
+    fn paint_canvas(
+        &mut self,
+        ui: &Ui,
+        painter: &egui::Painter,
+        rect: Rect,
+        pointer: Option<Pos2>,
+    ) {
         let visuals = ui.visuals();
         painter.rect_filled(rect, 0.0, visuals.extreme_bg_color);
         canvas::paint_grid(
@@ -557,8 +622,16 @@ impl WeavedrawApp {
             visuals.weak_text_color().gamma_multiply(0.35),
         );
 
-        for stroke in self.doc.visible() {
-            canvas::paint_stroke(painter, &self.camera, rect, stroke, 1.0);
+        match &mut self.renderer {
+            Some(r) => {
+                r.sync(ui.ctx(), &self.doc, self.camera.zoom, self.doc.generation);
+                painter.add(r.paint(rect, self.camera));
+            }
+            None => {
+                for stroke in self.doc.visible() {
+                    canvas::paint_stroke(painter, &self.camera, rect, stroke, 1.0);
+                }
+            }
         }
         for preview in self.previews.values() {
             canvas::paint_stroke(painter, &self.camera, rect, preview, 0.7);
@@ -767,7 +840,22 @@ impl WeavedrawApp {
                             .on_hover_text("Zoom (0 to reset)");
                         if let Some(rtt) = self.rtt {
                             ui.separator();
-                            ui.label(format!("{} ms", rtt.as_millis()));
+                            ui.label(format!("{} ms", rtt.as_millis()))
+                                .on_hover_text("Round-trip time to the server");
+                        }
+                        if let Some(cpu) = self.frame_cpu {
+                            ui.separator();
+                            let detail = match &self.renderer {
+                                Some(r) => format!(
+                                    "GPU: {} chunks, {} cached meshes, {} tessellated this frame",
+                                    r.chunk_count(),
+                                    r.cached_meshes(),
+                                    r.built_this_frame()
+                                ),
+                                None => "CPU rendering".to_owned(),
+                            };
+                            ui.label(format!("{:.1} ms/frame", cpu.as_secs_f64() * 1e3))
+                                .on_hover_text(format!("CPU time per frame · {detail}"));
                         }
                     });
                 });
@@ -776,7 +864,14 @@ impl WeavedrawApp {
 }
 
 impl eframe::App for WeavedrawApp {
-    fn ui(&mut self, ui: &mut Ui, _frame: &mut eframe::Frame) {
+    fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
+        if let Some(r) = &mut self.renderer {
+            r.destroy();
+        }
+    }
+
+    fn ui(&mut self, ui: &mut Ui, frame: &mut eframe::Frame) {
+        self.frame_cpu = frame.info().cpu_usage.map(Duration::from_secs_f32);
         self.handle_net();
         self.handle_shortcuts(ui);
 

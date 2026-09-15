@@ -3210,6 +3210,7 @@ name = "weavedraw-client"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "bytemuck",
  "crossbeam-channel",
  "eframe",
  "egui",

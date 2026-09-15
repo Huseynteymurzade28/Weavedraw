@@ -8,6 +8,7 @@
 
 mod app;
 mod canvas;
+mod gpu;
 mod net;
 
 use anyhow::{Context, bail};

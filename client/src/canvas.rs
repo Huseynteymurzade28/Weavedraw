@@ -1,8 +1,12 @@
 //! Canvas geometry: the world ↔ screen camera, stroke rasterisation through
 //! the `egui` painter, and hit-testing for the eraser.
 
-use common::{Point, Rgba, Stroke};
-use egui::{Color32, Painter, Pos2, Rect, Shape, Vec2, epaint::PathStroke};
+use std::collections::hash_map::Entry;
+use std::collections::{HashMap, HashSet};
+
+use common::{Point, Rgba, Stroke, StrokeId, geom};
+use egui::epaint::{Mesh, PathStroke, Tessellator};
+use egui::{Color32, Painter, Pos2, Rect, Shape, Vec2};
 
 pub const MIN_ZOOM: f32 = 0.1;
 pub const MAX_ZOOM: f32 = 20.0;
@@ -65,32 +69,173 @@ pub fn from_color32(c: Color32) -> Rgba {
 }
 
 /// `true` if the stroke's bounding box overlaps the visible world rect.
-fn in_view(stroke: &Stroke, (lo, hi): (Point, Point)) -> bool {
-    stroke
-        .bounds()
-        .is_some_and(|(min, max)| max.x >= lo.x && min.x <= hi.x && max.y >= lo.y && min.y <= hi.y)
+fn in_view(stroke: &Stroke, view: (Point, Point)) -> bool {
+    stroke.bounds().is_some_and(|b| overlaps(b, view))
 }
 
-/// Draw one stroke. `alpha` scales the stroke colour (previews are faded).
+/// Target spacing between spline samples, in screen pixels.
+const SMOOTH_STEP_PX: f32 = 3.0;
+const MAX_SUBDIVISIONS: usize = 12;
+
+/// Resample a stroke's control points for rendering at `zoom`.
+fn smoothed(points: &[Point], zoom: f32) -> Vec<Point> {
+    geom::catmull_rom(points, |span| {
+        ((span * zoom / SMOOTH_STEP_PX).ceil() as usize).clamp(1, MAX_SUBDIVISIONS)
+    })
+}
+
+/// Build the shapes for a stroke with `map` taking world points to the
+/// target space and `scale` the world→target factor (for the brush width).
+fn stroke_shape(stroke: &Stroke, scale: f32, alpha: f32, map: impl Fn(Point) -> Pos2) -> Shape {
+    let color = to_color32(stroke.color).gamma_multiply(alpha);
+    let width = (stroke.width * scale).max(0.75);
+    match stroke.points.as_slice() {
+        [] => Shape::Noop,
+        [p] => Shape::circle_filled(map(*p), width * 0.5, color),
+        pts => {
+            let path: Vec<Pos2> = smoothed(pts, scale).into_iter().map(map).collect();
+            // Round caps: egui paths have butt ends, so cap them manually.
+            Shape::Vec(vec![
+                Shape::circle_filled(path[0], width * 0.5, color),
+                Shape::circle_filled(path[path.len() - 1], width * 0.5, color),
+                Shape::line(path, PathStroke::new(width, color)),
+            ])
+        }
+    }
+}
+
+/// Draw one stroke straight through the painter (no caching). Used for
+/// strokes whose points change every frame: live previews and the one
+/// being drawn locally. `alpha` scales the colour so previews can be faded.
 pub fn paint_stroke(painter: &Painter, cam: &Camera, rect: Rect, stroke: &Stroke, alpha: f32) {
     if !in_view(stroke, cam.world_bounds(rect)) {
         return;
     }
-    let color = to_color32(stroke.color).gamma_multiply(alpha);
-    let width = (stroke.width * cam.zoom).max(0.75);
-    match stroke.points.as_slice() {
-        [] => {}
-        [p] => {
-            painter.circle_filled(cam.to_screen(rect, *p), width * 0.5, color);
-        }
-        pts => {
-            let screen: Vec<Pos2> = pts.iter().map(|p| cam.to_screen(rect, *p)).collect();
-            // Round caps: egui paths have butt ends, so cap them manually.
-            painter.circle_filled(screen[0], width * 0.5, color);
-            painter.circle_filled(screen[screen.len() - 1], width * 0.5, color);
-            painter.add(Shape::line(screen, PathStroke::new(width, color)));
+    painter.add(stroke_shape(stroke, cam.zoom, alpha, |p| {
+        cam.to_screen(rect, p)
+    }));
+}
+
+/// Tessellated meshes for committed strokes, keyed by id. This is the CPU
+/// half of the renderer: [`crate::gpu::StrokeRenderer`] uploads these into
+/// vertex buffers and the tessellation is never repeated while the entry
+/// lives.
+///
+/// Meshes are built at a *quantised* zoom (powers of 2^(1/4)) in
+/// coordinates local to the stroke's bounding-box corner; at draw time they
+/// are scaled by the small residual factor and translated into place. The
+/// residual is at most ~9% either way, so anti-aliasing feathering (which
+/// is baked into the mesh) stays visually correct. Crossing a zoom bucket
+/// or changing DPI invalidates everything.
+pub struct TessCache {
+    zoom: f32,
+    pixels_per_point: f32,
+    tessellator: Option<Tessellator>,
+    meshes: HashMap<StrokeId, Cached>,
+    /// Ids requested since the last [`Self::end_frame`]; the rest are pruned there.
+    touched: HashSet<StrokeId>,
+    built_this_frame: usize,
+}
+
+pub struct Cached {
+    /// World-space bounds, so view culling never re-walks the points.
+    pub bounds: (Point, Point),
+    /// Vertices at `(world - bounds.0) * zoom`.
+    pub mesh: Mesh,
+}
+
+impl Default for TessCache {
+    fn default() -> Self {
+        Self {
+            zoom: 0.0,
+            pixels_per_point: 0.0,
+            tessellator: None,
+            meshes: HashMap::new(),
+            touched: HashSet::new(),
+            built_this_frame: 0,
         }
     }
+}
+
+/// Snap a zoom level to the nearest 2^(k/4) bucket.
+pub fn quantize_zoom(zoom: f32) -> f32 {
+    2f32.powf((zoom.log2() * 4.0).round() / 4.0)
+}
+
+impl TessCache {
+    /// Call once per frame before requesting meshes. Returns `true` when
+    /// the zoom bucket or DPI changed and every mesh was dropped, so GPU-side
+    /// copies must be rebuilt too.
+    pub fn begin_frame(&mut self, ctx: &egui::Context, zoom: f32) -> bool {
+        let zoom = quantize_zoom(zoom);
+        let ppp = ctx.pixels_per_point();
+        self.built_this_frame = 0;
+        if self.tessellator.is_some() && zoom == self.zoom && ppp == self.pixels_per_point {
+            return false;
+        }
+        self.touched.clear();
+        let mut options = ctx.tessellation_options(|o| *o);
+        options.coarse_tessellation_culling = false;
+        // The pre-rasterised discs live in the font atlas, which we do not
+        // sample from, so end caps are tessellated geometrically.
+        options.prerasterized_discs = false;
+        let font_tex_size = ctx.fonts(|f| f.font_image_size());
+        self.tessellator = Some(Tessellator::new(ppp, options, font_tex_size, Vec::new()));
+        self.meshes.clear();
+        self.zoom = zoom;
+        self.pixels_per_point = ppp;
+        true
+    }
+
+    /// The quantised zoom the current meshes were built at.
+    pub fn zoom(&self) -> f32 {
+        self.zoom
+    }
+
+    /// Fetch (building on first use) the mesh for a stroke. `None` for an
+    /// empty stroke.
+    pub fn get(&mut self, stroke: &Stroke) -> Option<&Cached> {
+        let cache_zoom = self.zoom;
+        let tess = self.tessellator.as_mut().expect("begin_frame before get");
+        self.touched.insert(stroke.id);
+        let entry = match self.meshes.entry(stroke.id) {
+            Entry::Occupied(e) => e.into_mut(),
+            Entry::Vacant(v) => {
+                let bounds = stroke.bounds()?;
+                self.built_this_frame += 1;
+                let min = bounds.0;
+                let shape = stroke_shape(stroke, cache_zoom, 1.0, |p| {
+                    Pos2::new((p.x - min.x) * cache_zoom, (p.y - min.y) * cache_zoom)
+                });
+                let mut mesh = Mesh::default();
+                tess.tessellate_shape(shape, &mut mesh);
+                v.insert(Cached { bounds, mesh })
+            }
+        };
+        Some(entry)
+    }
+
+    /// Forget meshes for strokes that were not requested since the previous
+    /// call (i.e. during this sync pass).
+    pub fn end_frame(&mut self) {
+        let touched = &self.touched;
+        self.meshes.retain(|id, _| touched.contains(id));
+        self.touched.clear();
+    }
+
+    pub fn len(&self) -> usize {
+        self.meshes.len()
+    }
+
+    /// Meshes tessellated during the current frame (for the debug readout).
+    pub fn built_this_frame(&self) -> usize {
+        self.built_this_frame
+    }
+}
+
+/// `true` if two world-space rects `(min, max)` overlap.
+pub fn overlaps((min, max): (Point, Point), (lo, hi): (Point, Point)) -> bool {
+    max.x >= lo.x && min.x <= hi.x && max.y >= lo.y && min.y <= hi.y
 }
 
 /// Distance from `p` to the segment `a`–`b`.
@@ -209,6 +354,31 @@ mod tests {
         let s = Stroke::new(Uuid::nil(), Rgba::BLACK, 6.0).with_points([Point::new(3.0, 3.0)]);
         assert!(hit_test(&s, Point::new(5.0, 3.0), 0.0));
         assert!(!hit_test(&s, Point::new(7.0, 3.0), 0.0));
+    }
+
+    #[test]
+    fn zoom_quantisation_is_idempotent_and_close() {
+        for z in [0.1, 0.37, 1.0, 1.05, 2.9, 20.0] {
+            let q = quantize_zoom(z);
+            assert_eq!(quantize_zoom(q), q);
+            let ratio = z / q;
+            assert!((0.9..=1.1).contains(&ratio), "zoom {z} → {q}");
+        }
+        assert_eq!(quantize_zoom(1.0), 1.0);
+        assert_eq!(quantize_zoom(2.0), 2.0);
+    }
+
+    #[test]
+    fn smoothing_keeps_endpoints_and_densifies() {
+        let pts = [
+            Point::new(0.0, 0.0),
+            Point::new(10.0, 10.0),
+            Point::new(20.0, 0.0),
+        ];
+        let out = smoothed(&pts, 1.0);
+        assert!(out.len() > pts.len());
+        assert_eq!(out[0], pts[0]);
+        assert_eq!(*out.last().unwrap(), pts[2]);
     }
 
     #[test]

@@ -48,6 +48,13 @@ Command-line flags override the environment. The client reconnects with
 exponential backoff; strokes drawn while offline are queued and replayed
 after the next handshake.
 
+Rendering: committed strokes are smoothed (centripetal Catmull-Rom),
+tessellated once per zoom bucket and kept on the GPU in 64-stroke chunks
+that are only re-uploaded when their membership changes, so a static
+drawing costs one draw call per visible chunk regardless of size. Strokes
+are simplified (Ramer–Douglas–Peucker) before being replicated. Without an
+OpenGL context the client falls back to painting through egui each frame.
+
 | Input                          | Action                                   |
 |--------------------------------|------------------------------------------|
 | Left drag                      | Draw (Pen) / erase (Eraser) / pan (Pan)  |

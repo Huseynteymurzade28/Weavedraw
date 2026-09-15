@@ -8,9 +8,11 @@
 //! - [`crdt`]     — [`LamportClock`], [`Timestamp`], and the LWW [`StrokeSet`].
 //! - [`protocol`] — [`ClientMessage`] / [`ServerMessage`] exchanged over WebSocket.
 //! - [`codec`]    — `bincode` (default) or JSON (`json-wire` feature) framing.
+//! - [`geom`]     — polyline smoothing and simplification.
 
 pub mod codec;
 pub mod crdt;
+pub mod geom;
 pub mod protocol;
 pub mod types;
 
