@@ -41,7 +41,11 @@ fn parse_args() -> anyhow::Result<NetConfig> {
 
     let client_id = Uuid::new_v4();
     let name = name
-        .or_else(|| std::env::var("USER").ok())
+        .or_else(|| {
+            std::env::var("USER")
+                .or_else(|_| std::env::var("USERNAME"))
+                .ok()
+        })
         .filter(|n| !n.trim().is_empty())
         .unwrap_or_else(|| format!("guest-{}", &client_id.simple().to_string()[..4]));
 
