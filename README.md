@@ -17,7 +17,7 @@ an LWW-Element-Set CRDT (Lamport timestamps + tombstones).
 ```sh
 cargo test --workspace          # run all tests
 cargo run -p weavedraw-server   # start the server on ws://127.0.0.1:8080/ws
-cargo run -p weavedraw          # start a client   (step 4)
+cargo run -p weavedraw -- ROOM  # start a client and join ROOM (default: lobby)
 ```
 
 ### Server configuration
@@ -32,6 +32,33 @@ cargo run -p weavedraw          # start a client   (step 4)
 
 HTTP routes: `GET /ws` (WebSocket upgrade), `GET /rooms` (JSON), `GET /health`.
 
+### Client
+
+```sh
+weavedraw [ROOM] [--server ws://host:port/ws] [--name NAME]
+```
+
+| Variable            | Default                    | Meaning                    |
+|---------------------|----------------------------|----------------------------|
+| `WEAVEDRAW_SERVER`  | `ws://127.0.0.1:8080/ws`   | Server URL                 |
+| `WEAVEDRAW_ROOM`    | `lobby`                    | Room to join               |
+| `WEAVEDRAW_NAME`    | `$USER`                    | Display name shown to peers|
+
+Command-line flags override the environment. The client reconnects with
+exponential backoff; strokes drawn while offline are queued and replayed
+after the next handshake.
+
+| Input                          | Action                                   |
+|--------------------------------|------------------------------------------|
+| Left drag                      | Draw (Pen) / erase (Eraser) / pan (Pan)  |
+| Middle drag, Space + drag      | Pan                                      |
+| Scroll, Ctrl + scroll / pinch  | Pan, zoom around the pointer             |
+| `P` `E` `H`                    | Pen / Eraser / Pan                       |
+| `[` `]`                        | Brush width                              |
+| `Ctrl+Z`, `Ctrl+Shift+Z`       | Undo / redo (own strokes only)           |
+| `Ctrl+Shift+Backspace`         | Clear all of your own strokes            |
+| `0`                            | Reset view                               |
+
 Enable `--features json-wire` on **both** binaries to switch the wire format
 from bincode to JSON for debugging with `websocat`.
 
@@ -40,4 +67,4 @@ from bincode to JSON for debugging with `websocat`.
 - [x] Step 1 — workspace & dependencies
 - [x] Step 2 — shared types, CRDT, protocol, codec
 - [x] Step 3 — server (rooms, broadcast, persistence, graceful shutdown)
-- [ ] Step 4 — client
+- [x] Step 4 — client (canvas, floating toolbar, presence, reconnecting network loop)

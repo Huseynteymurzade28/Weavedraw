@@ -206,12 +206,12 @@ impl StrokeSet {
     }
 
     /// Visible strokes in draw order (oldest first).
-    pub fn visible(&self) -> impl Iterator<Item = &Stroke> + '_ {
+    pub fn visible(&self) -> impl DoubleEndedIterator<Item = &Stroke> + '_ {
         self.order.values().filter_map(|id| self.get(*id))
     }
 
     /// Visible strokes in draw order, paired with their add timestamp.
-    pub fn visible_with_ts(&self) -> impl Iterator<Item = (Timestamp, &Stroke)> + '_ {
+    pub fn visible_with_ts(&self) -> impl DoubleEndedIterator<Item = (Timestamp, &Stroke)> + '_ {
         self.order
             .iter()
             .filter_map(|(ts, id)| self.get(*id).map(|s| (*ts, s)))
