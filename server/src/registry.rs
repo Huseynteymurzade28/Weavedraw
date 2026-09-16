@@ -103,12 +103,29 @@ impl Registry {
     }
 }
 
+/// Read a room's snapshot. A file that no longer decodes (corrupt, or
+/// written by an older protocol) is moved aside with a `.corrupt` suffix
+/// so the room can open empty instead of rejecting every join; nothing is
+/// deleted.
 async fn load_snapshot(path: &PathBuf) -> anyhow::Result<StrokeSet> {
-    match tokio::fs::read(path).await {
-        Ok(bytes) => {
-            codec::decode(&bytes).with_context(|| format!("corrupt snapshot at {}", path.display()))
+    let bytes = match tokio::fs::read(path).await {
+        Ok(bytes) => bytes,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(StrokeSet::new()),
+        Err(e) => return Err(e).with_context(|| format!("reading {}", path.display())),
+    };
+    match codec::decode(&bytes) {
+        Ok(set) => Ok(set),
+        Err(e) => {
+            let aside = path.with_extension("bincode.corrupt");
+            warn!(
+                path = %path.display(),
+                moved_to = %aside.display(),
+                "unreadable snapshot ({e}); opening the room empty"
+            );
+            tokio::fs::rename(path, &aside)
+                .await
+                .with_context(|| format!("moving aside {}", path.display()))?;
+            Ok(StrokeSet::new())
         }
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(StrokeSet::new()),
-        Err(e) => Err(e).with_context(|| format!("reading {}", path.display())),
     }
 }

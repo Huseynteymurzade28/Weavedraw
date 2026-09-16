@@ -48,20 +48,31 @@ Command-line flags override the environment. The client reconnects with
 exponential backoff; strokes drawn while offline are queued and replayed
 after the next handshake.
 
-Rendering: committed strokes are smoothed (centripetal Catmull-Rom),
+Every element on the board is a `Stroke` with a `kind`: freehand polyline,
+line, rectangle, ellipse or text. Shapes are stored as two corner points
+and expanded to an outline on the client, so the CRDT, wire format and
+persistence never need to know about geometry. In-progress shapes and
+labels are streamed to peers like freehand strokes (replacing rather than
+appending, since their far corner or text keeps changing).
+
+Rendering: committed freehand strokes are smoothed (centripetal Catmull-Rom),
 tessellated once per zoom bucket and kept on the GPU in 64-stroke chunks
 that are only re-uploaded when their membership changes, so a static
 drawing costs one draw call per visible chunk regardless of size. Strokes
 are simplified (Ramer–Douglas–Peucker) before being replicated. Without an
 OpenGL context the client falls back to painting through egui each frame.
+Text is always painted through egui (it needs the font atlas) on top of the
+GPU chunks.
 
 | Input                          | Action                                   |
 |--------------------------------|------------------------------------------|
-| Left drag                      | Draw (Pen) / erase (Eraser) / pan (Pan)  |
+| Left drag                      | Draw (Pen, Line, Rect, Ellipse) / erase (Eraser) / pan (Pan) |
+| Shift + drag                   | Constrain to square / circle / 45° line  |
+| Left click (Text)              | Place a label; Enter commits, Shift+Enter breaks a line, Esc cancels |
 | Middle drag, Space + drag      | Pan                                      |
 | Scroll, Ctrl + scroll / pinch  | Pan, zoom around the pointer             |
-| `P` `E` `H`                    | Pen / Eraser / Pan                       |
-| `[` `]`                        | Brush width                              |
+| `P` `L` `R` `O` `T` `E` `H`    | Pen / Line / Rect / Ellipse / Text / Eraser / Pan |
+| `[` `]`                        | Brush width (text size for the Text tool) |
 | `Ctrl+Z`, `Ctrl+Shift+Z`       | Undo / redo (own strokes only)           |
 | `Ctrl+Shift+Backspace`         | Clear all of your own strokes            |
 | `0`                            | Reset view                               |
@@ -75,3 +86,4 @@ from bincode to JSON for debugging with `websocat`.
 - [x] Step 2 — shared types, CRDT, protocol, codec
 - [x] Step 3 — server (rooms, broadcast, persistence, graceful shutdown)
 - [x] Step 4 — client (canvas, floating toolbar, presence, reconnecting network loop)
+- [x] Step 5 — shape and text tools (protocol v2; v1 snapshots are moved aside as `.corrupt` and the room opens empty)

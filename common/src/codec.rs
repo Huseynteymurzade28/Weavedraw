@@ -134,6 +134,7 @@ mod tests {
                 client_id: me,
                 color: stroke.color,
                 width: stroke.width,
+                kind: stroke.kind.clone(),
                 points: stroke.points.clone(),
             }),
             ClientMessage::RequestSnapshot,

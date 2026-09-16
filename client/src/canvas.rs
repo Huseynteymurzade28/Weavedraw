@@ -4,7 +4,7 @@
 use std::collections::hash_map::Entry;
 use std::collections::{HashMap, HashSet};
 
-use common::{Point, Rgba, Stroke, StrokeId, geom};
+use common::{Point, Rgba, Stroke, StrokeId, StrokeKind, geom};
 use egui::epaint::{Mesh, PathStroke, Tessellator};
 use egui::{Color32, Painter, Pos2, Rect, Shape, Vec2};
 
@@ -84,16 +84,41 @@ fn smoothed(points: &[Point], zoom: f32) -> Vec<Point> {
     })
 }
 
+/// Target chord length for ellipse outlines, in screen pixels.
+const ELLIPSE_STEP_PX: f32 = 4.0;
+
+/// Chords to draw an ellipse with at `scale` so each is ~[`ELLIPSE_STEP_PX`].
+fn ellipse_segments(stroke: &Stroke, scale: f32) -> usize {
+    let [a, b, ..] = stroke.points.as_slice() else {
+        return 3;
+    };
+    // Ramanujan's perimeter approximation is overkill here; the mean
+    // radius is within a few percent for anything that looks like a circle.
+    let perimeter = std::f32::consts::PI * ((b.x - a.x).abs() + (b.y - a.y).abs()) * scale;
+    ((perimeter / ELLIPSE_STEP_PX).ceil() as usize).clamp(16, 256)
+}
+
 /// Build the shapes for a stroke with `map` taking world points to the
 /// target space and `scale` the world→target factor (for the brush width).
+/// Text strokes yield [`Shape::Noop`]: they need the font atlas, so
+/// [`paint_text`] draws them through the painter instead.
 fn stroke_shape(stroke: &Stroke, scale: f32, alpha: f32, map: impl Fn(Point) -> Pos2) -> Shape {
     let color = to_color32(stroke.color).gamma_multiply(alpha);
     let width = (stroke.width * scale).max(0.75);
-    match stroke.points.as_slice() {
+    let outline = stroke.outline(ellipse_segments(stroke, scale));
+    match &*outline {
         [] => Shape::Noop,
         [p] => Shape::circle_filled(map(*p), width * 0.5, color),
+        pts if stroke.kind.is_closed() => {
+            // `outline` repeats the first point; egui closes the path itself.
+            let path: Vec<Pos2> = pts[..pts.len() - 1].iter().map(|p| map(*p)).collect();
+            Shape::closed_line(path, PathStroke::new(width, color))
+        }
         pts => {
-            let path: Vec<Pos2> = smoothed(pts, scale).into_iter().map(map).collect();
+            let path: Vec<Pos2> = match stroke.kind {
+                StrokeKind::Freehand => smoothed(pts, scale).into_iter().map(map).collect(),
+                _ => pts.iter().map(|p| map(*p)).collect(),
+            };
             // Round caps: egui paths have butt ends, so cap them manually.
             Shape::Vec(vec![
                 Shape::circle_filled(path[0], width * 0.5, color),
@@ -111,9 +136,36 @@ pub fn paint_stroke(painter: &Painter, cam: &Camera, rect: Rect, stroke: &Stroke
     if !in_view(stroke, cam.world_bounds(rect)) {
         return;
     }
+    if stroke.text().is_some() {
+        paint_text(painter, cam, rect, stroke, alpha);
+        return;
+    }
     painter.add(stroke_shape(stroke, cam.zoom, alpha, |p| {
         cam.to_screen(rect, p)
     }));
+}
+
+/// Draw a text stroke. Text is laid out fresh every frame at the current
+/// zoom (egui caches galleys by content and size, so this is cheap) and is
+/// never part of the GPU chunks.
+pub fn paint_text(painter: &Painter, cam: &Camera, rect: Rect, stroke: &Stroke, alpha: f32) {
+    let Some((content, size)) = stroke.text() else {
+        return;
+    };
+    let Some(anchor) = stroke.points.first() else {
+        return;
+    };
+    if !in_view(stroke, cam.world_bounds(rect)) {
+        return;
+    }
+    let color = to_color32(stroke.color).gamma_multiply(alpha);
+    let galley = painter.layout_no_wrap(content.to_owned(), text_font(size, cam.zoom), color);
+    painter.galley(cam.to_screen(rect, *anchor), galley, color);
+}
+
+/// The font a text stroke of `size` canvas units is drawn with at `zoom`.
+pub fn text_font(size: f32, zoom: f32) -> egui::FontId {
+    egui::FontId::proportional((size * zoom).max(1.0))
 }
 
 /// Tessellated meshes for committed strokes, keyed by id. This is the CPU
@@ -195,6 +247,9 @@ impl TessCache {
     /// Fetch (building on first use) the mesh for a stroke. `None` for an
     /// empty stroke.
     pub fn get(&mut self, stroke: &Stroke) -> Option<&Cached> {
+        if stroke.text().is_some() {
+            return None; // drawn through the painter, see `paint_text`
+        }
         let cache_zoom = self.zoom;
         let tess = self.tessellator.as_mut().expect("begin_frame before get");
         self.touched.insert(stroke.id);
@@ -249,7 +304,12 @@ fn segment_distance(p: Point, a: Point, b: Point) -> f32 {
     p.distance(Point::new(a.x + ab.x * t, a.y + ab.y * t))
 }
 
-/// `true` if `p` lies within `tolerance` of the stroke's painted body.
+/// Chords used when hit-testing an ellipse; the error at 64 is far below
+/// any sensible tolerance.
+const HIT_TEST_ELLIPSE_SEGMENTS: usize = 64;
+
+/// `true` if `p` lies within `tolerance` of the stroke's painted body
+/// (for text: within its estimated box).
 pub fn hit_test(stroke: &Stroke, p: Point, tolerance: f32) -> bool {
     let reach = stroke.width * 0.5 + tolerance;
     let Some((min, max)) = stroke.bounds() else {
@@ -262,7 +322,10 @@ pub fn hit_test(stroke: &Stroke, p: Point, tolerance: f32) -> bool {
     {
         return false;
     }
-    match stroke.points.as_slice() {
+    if stroke.text().is_some() {
+        return true; // the bounds check above is the whole test
+    }
+    match &*stroke.outline(HIT_TEST_ELLIPSE_SEGMENTS) {
         [] => false,
         [only] => only.distance(p) <= reach,
         pts => pts
@@ -354,6 +417,31 @@ mod tests {
         let s = Stroke::new(Uuid::nil(), Rgba::BLACK, 6.0).with_points([Point::new(3.0, 3.0)]);
         assert!(hit_test(&s, Point::new(5.0, 3.0), 0.0));
         assert!(!hit_test(&s, Point::new(7.0, 3.0), 0.0));
+    }
+
+    #[test]
+    fn hit_test_shapes_use_their_outline() {
+        let rect = Stroke::new(Uuid::nil(), Rgba::BLACK, 2.0)
+            .with_kind(StrokeKind::Rect)
+            .with_points([Point::new(0.0, 0.0), Point::new(20.0, 10.0)]);
+        assert!(hit_test(&rect, Point::new(20.0, 5.0), 0.0)); // right edge
+        assert!(!hit_test(&rect, Point::new(10.0, 5.0), 0.0)); // hollow middle
+
+        let ellipse = Stroke::new(Uuid::nil(), Rgba::BLACK, 2.0)
+            .with_kind(StrokeKind::Ellipse)
+            .with_points([Point::new(-10.0, -10.0), Point::new(10.0, 10.0)]);
+        assert!(hit_test(&ellipse, Point::new(0.0, 10.0), 0.0)); // bottom of circle
+        assert!(!hit_test(&ellipse, Point::new(0.0, 0.0), 0.0)); // centre
+        assert!(!hit_test(&ellipse, Point::new(9.0, 9.0), 0.0)); // box corner, off-curve
+
+        let text = Stroke::new(Uuid::nil(), Rgba::BLACK, 2.0)
+            .with_kind(StrokeKind::Text {
+                content: "hello".into(),
+                size: 10.0,
+            })
+            .with_points([Point::ZERO]);
+        assert!(hit_test(&text, Point::new(5.0, 5.0), 0.0));
+        assert!(!hit_test(&text, Point::new(-5.0, 5.0), 0.0));
     }
 
     #[test]

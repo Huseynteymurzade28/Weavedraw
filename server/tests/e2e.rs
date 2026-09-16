@@ -159,6 +159,28 @@ impl Client {
     }
 }
 
+#[tokio::test]
+async fn unreadable_snapshot_is_moved_aside_and_room_opens_empty() {
+    let dir = temp_dir();
+    std::fs::create_dir_all(&dir).unwrap();
+    let file = dir.join(format!("broken.{}", codec::wire_format()));
+    std::fs::write(&file, b"definitely not a snapshot").unwrap();
+
+    let server = TestServer::start(dir.clone()).await;
+    let (_a, welcome) = Client::join(server.addr, "broken", "a").await;
+    match welcome {
+        ServerMessage::Welcome { snapshot, .. } => assert!(snapshot.is_empty()),
+        other => panic!("unexpected {other:?}"),
+    }
+    server.stop().await;
+
+    assert!(!file.exists(), "broken snapshot still in place");
+    let aside = dir.join(format!("broken.{}.corrupt", codec::wire_format()));
+    assert_eq!(std::fs::read(&aside).unwrap(), b"definitely not a snapshot");
+
+    let _ = std::fs::remove_dir_all(dir);
+}
+
 fn temp_dir() -> PathBuf {
     std::env::temp_dir().join(format!("weavedraw-test-{}", Uuid::new_v4()))
 }
@@ -291,6 +313,7 @@ async fn presence_is_relayed_with_identity_enforced() {
         client_id: Uuid::new_v4(),
         color: Rgba::WHITE,
         width: 1.0,
+        kind: common::StrokeKind::Freehand,
         points: vec![Point::ZERO],
     }))
     .await;

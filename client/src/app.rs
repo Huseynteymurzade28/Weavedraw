@@ -4,12 +4,12 @@ use std::collections::HashMap;
 use std::time::{Duration, Instant};
 
 use common::{
-    ClientId, ClientMessage, CursorState, LamportClock, Rgba, ServerMessage, Stroke, StrokeDelta,
-    StrokeId, StrokeOp, StrokeSet, geom,
+    ClientId, ClientMessage, CursorState, LamportClock, Point, Rgba, ServerMessage, Stroke,
+    StrokeDelta, StrokeId, StrokeKind, StrokeOp, StrokeSet, geom,
 };
 use egui::{
-    Align2, Area, Color32, CursorIcon, Frame, Id, Key, Modifiers, Order, PointerButton, Pos2, Rect,
-    RichText, Sense, Stroke as EguiStroke, Ui, Vec2,
+    Align2, Area, Color32, CursorIcon, Frame, Id, Key, KeyboardShortcut, Modifiers, Order,
+    PointerButton, Pos2, Rect, RichText, Sense, Stroke as EguiStroke, Ui, Vec2,
 };
 use tracing::{debug, warn};
 
@@ -44,24 +44,57 @@ pub fn presence_color(id: ClientId) -> Rgba {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Tool {
     Pen,
+    Line,
+    Rect,
+    Ellipse,
+    Text,
     Eraser,
     Pan,
 }
 
 impl Tool {
+    const ALL: [Tool; 7] = [
+        Tool::Pen,
+        Tool::Line,
+        Tool::Rect,
+        Tool::Ellipse,
+        Tool::Text,
+        Tool::Eraser,
+        Tool::Pan,
+    ];
+
     fn label(self) -> &'static str {
         match self {
             Tool::Pen => "✏ Pen",
+            Tool::Line => "╱ Line",
+            Tool::Rect => "▭ Rect",
+            Tool::Ellipse => "◯ Ellipse",
+            Tool::Text => "T Text",
             Tool::Eraser => "◻ Eraser",
             Tool::Pan => "✋ Pan",
         }
     }
 
-    fn hotkey(self) -> &'static str {
+    fn hotkey(self) -> Key {
         match self {
-            Tool::Pen => "P",
-            Tool::Eraser => "E",
-            Tool::Pan => "H",
+            Tool::Pen => Key::P,
+            Tool::Line => Key::L,
+            Tool::Rect => Key::R,
+            Tool::Ellipse => Key::O,
+            Tool::Text => Key::T,
+            Tool::Eraser => Key::E,
+            Tool::Pan => Key::H,
+        }
+    }
+
+    /// The stroke kind a drag with this tool produces, if it draws.
+    fn shape(self) -> Option<StrokeKind> {
+        match self {
+            Tool::Pen => Some(StrokeKind::Freehand),
+            Tool::Line => Some(StrokeKind::Line),
+            Tool::Rect => Some(StrokeKind::Rect),
+            Tool::Ellipse => Some(StrokeKind::Ellipse),
+            Tool::Text | Tool::Eraser | Tool::Pan => None,
         }
     }
 }
@@ -114,12 +147,28 @@ impl std::ops::Deref for Document {
     }
 }
 
-/// A stroke being drawn locally: the payload plus how much of it has already
-/// been streamed to peers as `StrokeDelta`s.
+/// A stroke being drawn locally: the payload plus what has already been
+/// streamed to peers as `StrokeDelta`s — a point count for freehand (deltas
+/// append), a dirty flag for shapes (deltas replace).
 struct Drawing {
     stroke: Stroke,
     sent: usize,
+    dirty: bool,
 }
+
+/// A text label being typed at a fixed anchor. The editor widget owns the
+/// content; `stroke.kind` is refreshed from it every frame.
+struct TextEditing {
+    stroke: Stroke,
+    content: String,
+    /// The content last streamed to peers.
+    sent: Option<String>,
+}
+
+/// Anything shorter than this (screen px) on release is a click, not a shape.
+const MIN_SHAPE_PX: f32 = 2.0;
+/// Text line height is derived from the brush width slider.
+const TEXT_SIZE_PER_WIDTH: f32 = 4.0;
 
 const MAX_HISTORY: usize = 200;
 const CURSOR_SEND_INTERVAL: Duration = Duration::from_millis(33);
@@ -142,6 +191,7 @@ pub struct WeavedrawApp {
     brush_color: Rgba,
     brush_width: f32,
     drawing: Option<Drawing>,
+    text: Option<TextEditing>,
     /// Ops applied in one gesture (a stroke or an eraser drag). Undo pops one.
     undo: Vec<Vec<StrokeOp>>,
     redo: Vec<Vec<StrokeOp>>,
@@ -196,6 +246,7 @@ impl WeavedrawApp {
             brush_color: PALETTE[6],
             brush_width: 4.0,
             drawing: None,
+            text: None,
             undo: Vec::new(),
             redo: Vec::new(),
             erasing: None,
@@ -347,29 +398,16 @@ impl WeavedrawApp {
         if d.client_id == self.me || self.doc.contains(d.stroke_id) {
             return;
         }
-        let StrokeDelta {
-            stroke_id,
-            client_id,
-            color,
-            width,
-            points,
-        } = d;
         // A peer draws one stroke at a time: a delta for a new id means any
         // older preview of theirs was abandoned.
-        if !self.previews.contains_key(&stroke_id) {
-            self.previews.retain(|_, s| s.client_id != client_id);
+        if !self.previews.contains_key(&d.stroke_id) {
+            self.previews.retain(|_, s| s.client_id != d.client_id);
         }
-        self.previews
-            .entry(stroke_id)
-            .or_insert_with(|| Stroke {
-                id: stroke_id,
-                client_id,
-                color,
-                width,
-                points: Vec::new(),
-            })
-            .points
-            .extend(points);
+        let preview = self
+            .previews
+            .entry(d.stroke_id)
+            .or_insert_with(|| d.start_preview());
+        d.apply_to(preview);
     }
 
     // ---- input ------------------------------------------------------------
@@ -395,14 +433,10 @@ impl WeavedrawApp {
             clear = i.consume_key(Modifiers::COMMAND | Modifiers::SHIFT, Key::Backspace);
             reset_view = i.consume_key(Modifiers::NONE, Key::Num0)
                 || i.consume_key(Modifiers::COMMAND, Key::Num0);
-            if i.consume_key(Modifiers::NONE, Key::P) {
-                tool = Some(Tool::Pen);
-            }
-            if i.consume_key(Modifiers::NONE, Key::E) {
-                tool = Some(Tool::Eraser);
-            }
-            if i.consume_key(Modifiers::NONE, Key::H) {
-                tool = Some(Tool::Pan);
+            for t in Tool::ALL {
+                if i.consume_key(Modifiers::NONE, t.hotkey()) {
+                    tool = Some(t);
+                }
             }
             if i.consume_key(Modifiers::NONE, Key::OpenBracket) {
                 width_step = -1;
@@ -422,7 +456,7 @@ impl WeavedrawApp {
             self.clear_mine();
         }
         if let Some(t) = tool {
-            self.tool = t;
+            self.select_tool(t);
         }
         if width_step != 0 {
             let step = if self.brush_width < 8.0 { 1.0 } else { 2.0 };
@@ -465,17 +499,33 @@ impl WeavedrawApp {
 
         match self.tool {
             Tool::Pen => self.pen_input(ui, response, rect),
+            Tool::Line | Tool::Rect | Tool::Ellipse => self.shape_input(ui, response, rect),
+            Tool::Text => self.text_input(ui, response, rect),
             Tool::Eraser => self.eraser_input(ui, response, rect),
             Tool::Pan => {}
         }
     }
 
+    fn select_tool(&mut self, tool: Tool) {
+        if tool != self.tool {
+            self.cancel_gesture();
+            self.tool = tool;
+        }
+    }
+
     /// Drop any half-finished gesture (e.g. the tool changed mid-drag).
+    /// Text that was being typed is committed rather than lost.
     fn cancel_gesture(&mut self) {
         self.drawing = None;
         if let Some(group) = self.erasing.take() {
             self.finish_erase(group);
         }
+        self.finish_text(true);
+    }
+
+    /// Line height for new text labels at the current brush width.
+    fn text_size(&self) -> f32 {
+        self.brush_width * TEXT_SIZE_PER_WIDTH
     }
 
     fn pen_input(&mut self, ui: &mut Ui, response: &egui::Response, rect: Rect) {
@@ -487,7 +537,11 @@ impl WeavedrawApp {
             let world = self.camera.to_world(rect, pos);
             let stroke =
                 Stroke::new(self.me, self.brush_color, self.brush_width).with_points([world]);
-            self.drawing = Some(Drawing { stroke, sent: 0 });
+            self.drawing = Some(Drawing {
+                stroke,
+                sent: 0,
+                dirty: false,
+            });
         }
 
         if response.dragged_by(PointerButton::Primary)
@@ -514,6 +568,7 @@ impl WeavedrawApp {
                 client_id: self.me,
                 color: d.stroke.color,
                 width: d.stroke.width,
+                kind: StrokeKind::Freehand,
                 points: d.stroke.points[d.sent..].to_vec(),
             };
             d.sent = d.stroke.points.len();
@@ -526,14 +581,196 @@ impl WeavedrawApp {
             // Shed redundant samples before the stroke is replicated; the
             // tolerance is a fraction of a pixel at the zoom it was drawn at.
             d.stroke.points = geom::simplify(&d.stroke.points, SIMPLIFY_PX / self.camera.zoom);
-            let ts = self.clock.tick();
-            self.commit(
-                vec![StrokeOp::Add {
-                    stroke: d.stroke,
-                    ts,
-                }],
-                true,
-            );
+            self.commit_stroke(d.stroke);
+        }
+    }
+
+    fn commit_stroke(&mut self, stroke: Stroke) {
+        let ts = self.clock.tick();
+        self.commit(vec![StrokeOp::Add { stroke, ts }], true);
+    }
+
+    /// Two-point shapes: drag from one corner (or end) to the other. Shift
+    /// constrains to a square / circle / 45° line.
+    fn shape_input(&mut self, ui: &mut Ui, response: &egui::Response, rect: Rect) {
+        ui.ctx().set_cursor_icon(CursorIcon::Crosshair);
+        let Some(kind) = self.tool.shape() else {
+            return;
+        };
+
+        if response.drag_started_by(PointerButton::Primary)
+            && let Some(pos) = response.interact_pointer_pos()
+        {
+            let world = self.camera.to_world(rect, pos);
+            let stroke = Stroke::new(self.me, self.brush_color, self.brush_width)
+                .with_kind(kind.clone())
+                .with_points([world, world]);
+            self.drawing = Some(Drawing {
+                stroke,
+                sent: 0,
+                dirty: true,
+            });
+        }
+
+        if response.dragged_by(PointerButton::Primary)
+            && let Some(pos) = response.interact_pointer_pos()
+            && let Some(d) = &mut self.drawing
+        {
+            let start = d.stroke.points[0];
+            let mut end = self.camera.to_world(rect, pos);
+            if ui.input(|i| i.modifiers.shift) {
+                end = constrain(&kind, start, end);
+            }
+            if d.stroke.points[1] != end {
+                d.stroke.points[1] = end;
+                d.dirty = true;
+            }
+        }
+
+        if let Some(d) = &mut self.drawing
+            && d.dirty
+        {
+            let delta = StrokeDelta {
+                stroke_id: d.stroke.id,
+                client_id: self.me,
+                color: d.stroke.color,
+                width: d.stroke.width,
+                kind: d.stroke.kind.clone(),
+                points: d.stroke.points.clone(),
+            };
+            d.dirty = false;
+            self.net.send(ClientMessage::StrokeDelta(delta));
+        }
+
+        if response.drag_stopped_by(PointerButton::Primary)
+            && let Some(d) = self.drawing.take()
+        {
+            let [a, b] = [d.stroke.points[0], d.stroke.points[1]];
+            if a.distance(b) * self.camera.zoom >= MIN_SHAPE_PX {
+                self.commit_stroke(d.stroke);
+            }
+        }
+    }
+
+    /// Click to place a label; the editor itself is drawn by [`Self::text_editor`].
+    fn text_input(&mut self, ui: &mut Ui, response: &egui::Response, rect: Rect) {
+        ui.ctx().set_cursor_icon(CursorIcon::Text);
+        if response.clicked_by(PointerButton::Primary)
+            && let Some(pos) = response.interact_pointer_pos()
+        {
+            // Clicking elsewhere finishes the current label and starts another.
+            self.finish_text(true);
+            let world = self.camera.to_world(rect, pos);
+            let stroke = Stroke::new(self.me, self.brush_color, self.brush_width)
+                .with_kind(StrokeKind::Text {
+                    content: String::new(),
+                    size: self.text_size(),
+                })
+                .with_points([world]);
+            self.text = Some(TextEditing {
+                stroke,
+                content: String::new(),
+                sent: None,
+            });
+        }
+    }
+
+    /// Close the label editor, committing its text (unless empty) when
+    /// `commit` is set.
+    fn finish_text(&mut self, commit: bool) {
+        let Some(mut t) = self.text.take() else {
+            return;
+        };
+        let content = t.content.trim_end().to_owned();
+        if commit && !content.is_empty() {
+            if let StrokeKind::Text { content: c, .. } = &mut t.stroke.kind {
+                *c = content;
+            }
+            self.commit_stroke(t.stroke);
+        }
+        // Peers hold a preview of the label until they see the Add (or a
+        // cursor update with `drawing = false`), which the caller's next
+        // frame provides.
+    }
+
+    /// The floating text editor for the label being typed, if any. Returns
+    /// after the widget has been shown so the canvas can react to focus.
+    fn text_editor(&mut self, ctx: &egui::Context, rect: Rect) {
+        let default_size = self.text_size();
+        let camera = self.camera;
+        let Some(t) = &mut self.text else { return };
+        let anchor = camera.to_screen(rect, t.stroke.points[0]);
+        let size = match &t.stroke.kind {
+            StrokeKind::Text { size, .. } => *size,
+            _ => default_size,
+        };
+        let font = canvas::text_font(size, camera.zoom);
+        let id = Id::new("text-editor").with(t.stroke.id);
+        let mut finish: Option<bool> = None;
+
+        // Native margins would shift the glyphs away from the anchor, so the
+        // editor is drawn frameless; the box behind it is painted by hand.
+        Area::new(id)
+            .order(Order::Foreground)
+            .fixed_pos(anchor - Vec2::new(4.0, 2.0))
+            .show(ctx, |ui| {
+                let edit = egui::TextEdit::multiline(&mut t.content)
+                    .id(id.with("edit"))
+                    .font(font)
+                    .text_color(canvas::to_color32(t.stroke.color))
+                    .frame(Frame::NONE)
+                    .margin(egui::Margin::symmetric(4, 2))
+                    .desired_width(0.0)
+                    .desired_rows(1)
+                    .return_key(KeyboardShortcut::new(Modifiers::SHIFT, Key::Enter));
+                let r = ui.add(edit);
+                let frame_color = ui.visuals().widgets.active.bg_stroke.color;
+                ui.painter().rect_stroke(
+                    r.rect,
+                    2.0,
+                    EguiStroke::new(1.0, frame_color),
+                    egui::StrokeKind::Outside,
+                );
+                if t.sent.is_none() {
+                    r.request_focus();
+                }
+                let (enter, escape) = ui.input(|i| {
+                    (
+                        i.key_pressed(Key::Enter) && !i.modifiers.shift,
+                        i.key_pressed(Key::Escape),
+                    )
+                });
+                // Escape makes the widget surrender focus itself, so it
+                // shows up as `lost_focus` in the same frame.
+                if escape && (r.has_focus() || r.lost_focus()) {
+                    finish = Some(false);
+                } else if enter && r.has_focus() {
+                    finish = Some(true);
+                } else if r.lost_focus() && t.sent.is_some() {
+                    // Clicked away (toolbar, another window…): keep the text.
+                    finish = Some(true);
+                }
+            });
+
+        // Stream the label as it is typed.
+        if t.sent.as_ref() != Some(&t.content) {
+            t.stroke.kind = StrokeKind::Text {
+                content: t.content.clone(),
+                size,
+            };
+            t.sent = Some(t.content.clone());
+            self.net.send(ClientMessage::StrokeDelta(StrokeDelta {
+                stroke_id: t.stroke.id,
+                client_id: self.me,
+                color: t.stroke.color,
+                width: t.stroke.width,
+                kind: t.stroke.kind.clone(),
+                points: t.stroke.points.clone(),
+            }));
+        }
+
+        if let Some(commit) = finish {
+            self.finish_text(commit);
         }
     }
 
@@ -598,7 +835,7 @@ impl WeavedrawApp {
             .map(|p| self.camera.to_world(rect, p));
         let mut state = CursorState::new(self.me, self.name.clone(), self.presence);
         state.position = position;
-        state.drawing = self.drawing.is_some();
+        state.drawing = self.drawing.is_some() || self.text.is_some();
 
         let changed = self.last_cursor.as_ref() != Some(&state);
         let due = self.last_cursor_sent.elapsed() >= CURSOR_SEND_INTERVAL;
@@ -642,6 +879,12 @@ impl WeavedrawApp {
                 for stroke in self.doc.visible() {
                     canvas::paint_stroke(painter, &self.camera, rect, stroke, 1.0);
                 }
+            }
+        }
+        // Text is never in the GPU chunks; paint it through egui on top.
+        if self.renderer.is_some() {
+            for stroke in self.doc.visible().filter(|s| s.text().is_some()) {
+                canvas::paint_text(painter, &self.camera, rect, stroke, 1.0);
             }
         }
         for preview in self.previews.values() {
@@ -698,15 +941,14 @@ impl WeavedrawApp {
             .show(ctx, |ui| {
                 Frame::window(ui.style()).inner_margin(8.0).show(ui, |ui| {
                     ui.horizontal(|ui| {
-                        for tool in [Tool::Pen, Tool::Eraser, Tool::Pan] {
+                        for tool in Tool::ALL {
                             let selected = self.tool == tool;
                             if ui
                                 .selectable_label(selected, tool.label())
-                                .on_hover_text(format!("Shortcut: {}", tool.hotkey()))
+                                .on_hover_text(format!("Shortcut: {}", tool.hotkey().name()))
                                 .clicked()
                             {
-                                self.cancel_gesture();
-                                self.tool = tool;
+                                self.select_tool(tool);
                             }
                         }
                         ui.separator();
@@ -739,7 +981,11 @@ impl WeavedrawApp {
                                 .show_value(false)
                                 .logarithmic(true),
                         )
-                        .on_hover_text(format!("Width {:.0}  ([ / ])", self.brush_width));
+                        .on_hover_text(if self.tool == Tool::Text {
+                            format!("Text size {:.0}  ([ / ])", self.text_size())
+                        } else {
+                            format!("Width {:.0}  ([ / ])", self.brush_width)
+                        });
                         let preview = ui.allocate_exact_size(Vec2::splat(34.0), Sense::hover()).0;
                         ui.painter().circle_filled(
                             preview.center(),
@@ -799,7 +1045,7 @@ impl WeavedrawApp {
                     row(
                         self.presence,
                         &format!("{} (you)", self.name),
-                        self.drawing.is_some(),
+                        self.drawing.is_some() || self.text.is_some(),
                         true,
                     );
                     let mut peers: Vec<&CursorState> = self.peers.values().collect();
@@ -874,6 +1120,27 @@ impl WeavedrawApp {
     }
 }
 
+/// Snap `end` so the shape from `start` is regular: a square / circle for
+/// boxes, a multiple of 45° for lines.
+fn constrain(kind: &StrokeKind, start: Point, end: Point) -> Point {
+    let (dx, dy) = (end.x - start.x, end.y - start.y);
+    match kind {
+        StrokeKind::Line => {
+            let len = (dx * dx + dy * dy).sqrt();
+            if len <= f32::EPSILON {
+                return end;
+            }
+            let angle =
+                (dy.atan2(dx) / std::f32::consts::FRAC_PI_4).round() * std::f32::consts::FRAC_PI_4;
+            Point::new(start.x + len * angle.cos(), start.y + len * angle.sin())
+        }
+        _ => {
+            let side = dx.abs().max(dy.abs());
+            Point::new(start.x + side.copysign(dx), start.y + side.copysign(dy))
+        }
+    }
+}
+
 impl eframe::App for WeavedrawApp {
     fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
         if let Some(r) = &mut self.renderer {
@@ -891,6 +1158,7 @@ impl eframe::App for WeavedrawApp {
         let (response, painter) = ui.allocate_painter(ui.available_size(), Sense::click_and_drag());
         let rect = response.rect;
         self.canvas_input(ui, &response, rect);
+        self.text_editor(ui.ctx(), rect);
         self.send_cursor(&response, rect);
         let pointer = response
             .hover_pos()
@@ -921,5 +1189,26 @@ mod tests {
         let c = presence_color(id);
         assert_eq!(c, presence_color(id));
         assert!(PALETTE[1..PALETTE.len() - 1].contains(&c));
+    }
+
+    #[test]
+    fn constrain_makes_squares_and_snaps_lines() {
+        let o = Point::ZERO;
+        let sq = constrain(&StrokeKind::Rect, o, Point::new(10.0, -3.0));
+        assert_eq!(sq, Point::new(10.0, -10.0));
+        let sq = constrain(&StrokeKind::Ellipse, o, Point::new(-2.0, 7.0));
+        assert_eq!(sq, Point::new(-7.0, 7.0));
+
+        // 10° off horizontal snaps to 0°, keeping the length.
+        let end = Point::new(
+            10.0 * 10f32.to_radians().cos(),
+            10.0 * 10f32.to_radians().sin(),
+        );
+        let l = constrain(&StrokeKind::Line, o, end);
+        assert!((l.x - 10.0).abs() < 1e-4 && l.y.abs() < 1e-4);
+        // 40° snaps to 45°.
+        let l = constrain(&StrokeKind::Line, o, Point::new(10.0, 8.39));
+        assert!((l.x - l.y).abs() < 1e-3);
+        assert_eq!(constrain(&StrokeKind::Line, o, o), o);
     }
 }
