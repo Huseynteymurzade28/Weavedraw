@@ -306,6 +306,12 @@ impl WeavedrawApp {
             }
             ServerMessage::Cursor(c) => {
                 if c.client_id != self.me {
+                    // A peer that stopped drawing without committing (e.g. it
+                    // switched tools mid-drag) never sends an `Add`, so this is
+                    // the only signal that its preview should go away.
+                    if !c.drawing {
+                        self.previews.retain(|_, s| s.client_id != c.client_id);
+                    }
                     self.peers.insert(c.client_id, c);
                 }
             }
@@ -348,6 +354,11 @@ impl WeavedrawApp {
             width,
             points,
         } = d;
+        // A peer draws one stroke at a time: a delta for a new id means any
+        // older preview of theirs was abandoned.
+        if !self.previews.contains_key(&stroke_id) {
+            self.previews.retain(|_, s| s.client_id != client_id);
+        }
         self.previews
             .entry(stroke_id)
             .or_insert_with(|| Stroke {
